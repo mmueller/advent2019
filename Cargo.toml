@@ -1,0 +1,9 @@
+[package]
+name = "advent2019"
+version = "0.1.0"
+authors = ["Mike Mueller <mike@subfocal.net>"]
+edition = "2018"
+
+[dependencies]
+anyhow = "1.0"
+argparse = ""
