@@ -85,4 +85,12 @@ mod tests {
         assert_eq!(50346,
                    Solver::fuel_for_mass_accounting_for_fuel_mass(100756));
     }
+
+    #[test]
+    fn test_fuel_for_mass_accounting_for_fuel_mass_worst_case() {
+        assert_eq!(
+            9223372036854775669,
+            Solver::fuel_for_mass_accounting_for_fuel_mass(u64::max_value())
+        );
+    }
 }
