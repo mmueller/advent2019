@@ -1,4 +1,5 @@
 mod advent;
+mod shared;
 
 use argparse::{ArgumentParser, StoreOption};
 
