@@ -25,7 +25,7 @@ impl Solver {
     }
 
     fn find_inputs(program: IntcodeProgram,
-                   output: usize) -> Result<(), Error> {
+                   output: isize) -> Result<(), Error> {
         'outer: for input1 in 0..=99 {
             for input2 in 0..=99 {
                 let mut tmp_prog = program.clone();
