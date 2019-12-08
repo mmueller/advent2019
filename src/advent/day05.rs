@@ -18,17 +18,14 @@ impl AdventSolver for Solver {
 impl Solver {
     fn run_diagnostic_test(input: isize) -> Result<isize, Error> {
         let mut program = IntcodeProgram::from_path("input/day05.txt")?;
-        let mut result = 0;
-        let input = || input;
-        let mut output = |v| {
-            match v {
-                0 => Ok(()),
-                code @ _ => { result = code; Ok(()) },
-            }
-        };
-        program.connect_input(&input);
-        program.connect_output(&mut output);
+        let input_sender = program.create_input_channel();
+        let output_receiver = program.create_output_channel();
+        input_sender.send(input)?;
         program.run()?;
+        let mut result = 0;
+        while result == 0 {
+            result = output_receiver.recv()?;
+        }
         Ok(result)
     }
 }

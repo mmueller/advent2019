@@ -2,16 +2,21 @@ use anyhow::{Error, format_err};
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
+use std::sync::mpsc::{channel, Receiver, Sender};
 
-type InputCallback<'a> = dyn Fn()->isize + 'a;
-type OutputCallback<'a> = dyn FnMut(isize)->Result<(), Error> + 'a;
+type IntcodeReceiver = Receiver<isize>;
+type IntcodeSender = Sender<isize>;
 
-pub struct IntcodeProgram<'a> {
+pub struct IntcodeProgram {
     inst: Vec<isize>,
     pc: usize,
     state: IntcodeProgramState,
-    input: Option<&'a InputCallback<'a>>,
-    output: Option<&'a mut OutputCallback<'a>>,
+    input_reader: Option<IntcodeReceiver>,
+    input_sender: Option<IntcodeSender>,
+    output_sender: Option<IntcodeSender>,
+    last_output: isize,
+    blocking_input: bool,
+    waiting_for_input: bool,
 }
 
 #[derive(Clone,PartialEq)]
@@ -26,7 +31,7 @@ pub enum ParameterMode {
     Immediate,
 }
 
-impl<'a> IntcodeProgram<'a> {
+impl IntcodeProgram {
     pub fn from_path(path: &str) -> Result<Self, Error> {
         let mut text = String::new();
         File::open(path)?.read_to_string(&mut text)?;
@@ -41,27 +46,65 @@ impl<'a> IntcodeProgram<'a> {
             inst: inst,
             pc: 0,
             state: IntcodeProgramState::Running,
-            input: None,
-            output: None,
+            input_sender: None,
+            input_reader: None,
+            output_sender: None,
+            last_output: 0,
+            blocking_input: true,
+            waiting_for_input: false,
         })
     }
 
-    pub fn connect_input(&mut self, input: &'a InputCallback<'a>) {
-        self.input = Some(input);
+    // Creates a channel for you and returns the sender half.
+    pub fn create_input_channel(&mut self) -> IntcodeSender {
+        let (sender, receiver) = channel();
+        self.input_reader = Some(receiver);
+        self.input_sender = Some(sender.clone());
+        sender
+    }
+
+    pub fn connect_input(&mut self, input: IntcodeReceiver,
+                         sender: IntcodeSender) {
+        self.input_reader = Some(input);
+        self.input_sender = Some(sender);
+    }
+
+    pub fn send_input(&self, value: isize) -> Result<(), Error> {
+        match &self.input_sender {
+            Some(ref sender) => {
+                sender.send(value)?;
+                Ok(())
+            },
+            None => {
+                Err(format_err!("No input channel available."))
+            }
+        }
     }
 
     #[allow(dead_code)]
     pub fn disconnect_input(&mut self) {
-        self.input = None;
+        self.input_reader = None;
+        self.input_sender = None;
     }
 
-    pub fn connect_output(&mut self, output: &'a mut OutputCallback<'a>) {
-        self.output = Some(output);
+    // Creates a channel for you and returns the receiver half.
+    pub fn create_output_channel(&mut self) -> IntcodeReceiver {
+        let (sender, receiver) = channel();
+        self.output_sender = Some(sender);
+        receiver
+    }
+
+    pub fn connect_output(&mut self, output: IntcodeSender) {
+        self.output_sender = Some(output);
     }
 
     #[allow(dead_code)]
     pub fn disconnect_output(&mut self) {
-        self.output = None;
+        self.output_sender = None;
+    }
+
+    pub fn last_output(&self) -> isize {
+        self.last_output
     }
 
     // Same as run, but displays program state at each step.
@@ -74,12 +117,9 @@ impl<'a> IntcodeProgram<'a> {
         self.state == IntcodeProgramState::Running
     }
 
+    // "output" as defined in day 2 (value at addr 0), not the channels
     pub fn output(&self) -> isize {
         self.inst[0]
-    }
-
-    pub fn run(&mut self) -> Result<isize, Error> {
-        self.run_program(false)
     }
 
     // Set "inputs" as described in day 2, which means the values as positions 1
@@ -87,6 +127,28 @@ impl<'a> IntcodeProgram<'a> {
     pub fn set_inputs(&mut self, input1: isize, input2: isize) {
         self.inst[1] = input1;
         self.inst[2] = input2;
+    }
+
+    pub fn run(&mut self) -> Result<isize, Error> {
+        self.run_program(false)
+    }
+
+    pub fn run_until_input_needed(&mut self) -> Result<(), Error> {
+        while self.is_running() {
+            self.step()?;
+            if self.waiting_for_input() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_blocking_input(&mut self, blocking: bool) {
+        self.blocking_input = blocking;
+    }
+
+    pub fn waiting_for_input(&self) -> bool {
+        self.waiting_for_input
     }
 
     pub fn step(&mut self) -> Result<(), Error> {
@@ -109,27 +171,42 @@ impl<'a> IntcodeProgram<'a> {
             // Input
             3 => {
                 let target = self.get_param(0, 0)?;
-                match self.input {
-                    Some(ref f) => {
-                        self.inst[target as usize] = f();
+                match self.input_reader {
+                    Some(ref receiver) => {
+                        if self.blocking_input {
+                            self.inst[target as usize] = receiver.recv()?;
+                        } else {
+                            match receiver.try_recv() {
+                                Ok(value) => {
+                                    self.inst[target as usize] = value;
+                                    self.waiting_for_input = false;
+                                },
+                                Err(_) => {
+                                    self.waiting_for_input = true;
+                                }
+                            }
+                        }
                     },
                     None => {
                         return Err(format_err!(
-                            "Input op called without input callback."));
+                            "Input op called without input channel."));
                     },
                 }
-                self.pc += 2;
+                if !self.waiting_for_input {
+                    self.pc += 2;
+                }
             },
             // Output
             4 => {
                 let value = self.get_param(op, 0)?;
-                match self.output {
-                    Some(ref mut f) => {
-                        f(value)?;
+                match self.output_sender {
+                    Some(ref sender) => {
+                        sender.send(value)?;
+                        self.last_output = value;
                     },
                     None => {
                         return Err(format_err!(
-                                "Output op called without output callback."));
+                            "Output op called without output channel."));
                     },
                 }
                 self.pc += 2;
@@ -138,7 +215,7 @@ impl<'a> IntcodeProgram<'a> {
             5 | 6 => {
                 let val = self.get_param(op, 0)?;
                 let addr = self.get_param(op, 1)?;
-                if op % 100 == 5 && val != 0 || op  % 100== 6 && val == 0 {
+                if op % 100 == 5 && val != 0 || op % 100 == 6 && val == 0 {
                     self.pc = addr as usize;
                 } else {
                     self.pc += 3;
@@ -148,8 +225,8 @@ impl<'a> IntcodeProgram<'a> {
                 self.state = IntcodeProgramState::Halted;
             },
             _ => {
-                return Err(format_err!("Invalid opcode: {}",
-                                       self.inst[self.pc]));
+                return Err(format_err!("Invalid opcode: {} (pc: {})",
+                                       self.inst[self.pc], self.pc));
             },
         }
         Ok(())
@@ -197,20 +274,23 @@ impl<'a> IntcodeProgram<'a> {
     }
 }
 
-// Cloning a program does not include the input/output callbacks.
-impl<'a> Clone for IntcodeProgram<'a> {
+impl Clone for IntcodeProgram {
     fn clone(&self) -> Self {
         Self {
             inst: self.inst.clone(),
             pc: self.pc,
             state: self.state.clone(),
-            input: None,
-            output: None,
+            input_reader: None,
+            input_sender: None,
+            output_sender: None,
+            last_output: 0,
+            blocking_input: true,
+            waiting_for_input: false,
         }
     }
 }
 
-impl<'a> fmt::Debug for IntcodeProgram<'a> {
+impl fmt::Debug for IntcodeProgram {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.inst.iter()
                                  .map(|i| i.to_string())
@@ -241,16 +321,11 @@ mod tests {
     // output value it yields (using the callbacks).
     fn run_program_io(text: &str, input: isize) -> Result<isize, Error> {
         let mut program = IntcodeProgram::from_string(text).unwrap();
-        let mut result = 0;
-        let input = || input;
-        let mut output = |v| {
-            result = v;
-            Ok(())
-        };
-        program.connect_input(&input);
-        program.connect_output(&mut output);
+        let input_sender = program.create_input_channel();
+        let output_receiver = program.create_output_channel();
+        input_sender.send(input)?;
         program.run()?;
-        Ok(result)
+        Ok(output_receiver.recv()?)
     }
 
     #[test]
@@ -374,31 +449,16 @@ mod tests {
     #[test]
     fn test_input() {
         let mut program = IntcodeProgram::from_string("3,0,99").unwrap();
-        program.connect_input(&|| 5);
+        let input_sender = program.create_input_channel();
+        input_sender.send(5).unwrap();
         assert_eq!(5, program.run().unwrap());
     }
 
     #[test]
     fn test_output() {
-        let mut result = 0;
-        let mut save_output = |v| {
-            result = v;
-            Ok(())
-        };
         let mut program = IntcodeProgram::from_string("4,0,99").unwrap();
-        program.connect_output(&mut save_output);
+        let output_receiver = program.create_output_channel();
         assert!(program.run().is_ok());
-        assert_eq!(4, result);
-    }
-
-    #[test]
-    fn test_output_error() {
-        // Errors from the output callback should stop program execution
-        let mut program = IntcodeProgram::from_string("4,0,99").unwrap();
-        let mut output = |_| {
-            Err(format_err!("whoops"))
-        };
-        program.connect_output(&mut output);
-        assert!(program.run().is_err());
+        assert_eq!(4, output_receiver.recv().unwrap());
     }
 }
