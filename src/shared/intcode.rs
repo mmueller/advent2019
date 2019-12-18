@@ -33,17 +33,31 @@ enum ProgramState {
     Halted,
 }
 
-#[derive(Clone,Debug,PartialEq)]
+#[derive(Copy,Clone,Debug,PartialEq)]
 enum Parameter {
     Address(usize),
     Value(isize),
 }
 
-#[derive(Clone,PartialEq)]
+#[derive(Copy,Clone,PartialEq)]
 enum ParameterMode {
     Position,
     Immediate,
     Relative,
+}
+
+#[derive(Copy,Clone)]
+enum Op {
+    Add { x: Parameter, y: Parameter, dest: Parameter },
+    Multiply { x: Parameter, y: Parameter, dest: Parameter },
+    Input { dest: Parameter },
+    Output { value: Parameter },
+    JumpIfTrue { cond: Parameter, dest: Parameter },
+    JumpIfFalse { cond: Parameter, dest: Parameter },
+    LessThan { x: Parameter, y: Parameter, dest: Parameter },
+    Equal { x: Parameter, y: Parameter, dest: Parameter },
+    AdjustRelativeBase { offset: Parameter },
+    Halt,
 }
 
 impl Program {
@@ -178,99 +192,113 @@ impl Simulator {
     }
 
     pub fn step(&mut self) -> Result<(), Error> {
-        let op = self.mem[self.pc];
-        match op % 100 {
-            // Binary operations
-            1 | 2 | 7 | 8 => {
-                let param0 = self.load(self.get_param(0)?);
-                let param1 = self.load(self.get_param(1)?);
-                let target = self.get_param(2)?;
-                self.store(target, match op % 100 {
-                    1 => param0 + param1,
-                    2 => param0 * param1,
-                    7 => if param0 < param1 { 1 } else { 0 },
-                    8 => if param0 == param1 { 1 } else { 0 },
-                    _ => unreachable!(),
-                })?;
-                self.pc += 4;
+        let op = self.get_next_op()?;
+        let mut advance = true;
+        match op {
+            Op::Add{x, y, dest} => {
+                self.store(dest, self.load(x) + self.load(y))?;
             },
-            // Input
-            3 => {
-                let target = self.get_param(0)?;
-                match self.io.input_reader {
-                    Some(ref receiver) => {
-                        if self.io.blocking_input {
-                            let value = receiver.recv()?;
-                            self.store(target, value)?;
-                        } else {
-                            match receiver.try_recv() {
-                                Ok(value) => {
-                                    self.store(target, value)?;
-                                    self.state = ProgramState::Running;
-                                },
-                                Err(_) => {
-                                    self.state = ProgramState::Wait;
-                                }
-                            }
-                        }
-                    },
+            Op::Multiply{x, y, dest} => {
+                self.store(dest, self.load(x) * self.load(y))?;
+            },
+            Op::Input{dest} => {
+                match self.io.read_input()? {
+                    Some(value) => self.store(dest, value)?,
                     None => {
-                        return Err(format_err!(
-                            "Input op called without input channel."));
+                        self.state = ProgramState::Wait;
+                        advance = false;
                     },
                 }
-                if self.state != ProgramState::Wait {
-                    self.pc += 2;
+            },
+            Op::Output{value} => {
+                self.io.send_output(self.load(value))?;
+            },
+            Op::JumpIfTrue{cond, dest} => {
+                if self.load(cond) != 0 {
+                    self.pc = self.load(dest) as usize;
+                    advance = false;
                 }
             },
-            // Output
-            4 => {
-                let value = self.load(self.get_param(0)?);
-                match self.io.output_sender {
-                    Some(ref sender) => {
-                        sender.send(value)?;
-                        self.io.last_output = value;
-                    },
-                    None => {
-                        return Err(format_err!(
-                            "Output op called without output channel."));
-                    },
-                }
-                self.pc += 2;
-            },
-            // Jump-if-true and jump-if-false
-            5 | 6 => {
-                let val = self.load(self.get_param(0)?);
-                let addr = self.load(self.get_param(1)?);
-                if op % 100 == 5 && val != 0 || op % 100 == 6 && val == 0 {
-                    self.pc = addr as usize;
-                } else {
-                    self.pc += 3;
+            Op::JumpIfFalse{cond, dest} => {
+                if self.load(cond) == 0 {
+                    self.pc = self.load(dest) as usize;
+                    advance = false;
                 }
             },
-            // Adjust relative base
-            9 => {
-                let val = self.load(self.get_param(0)?);
-                let new_base = self.relative_base as isize + val;
+            Op::LessThan{x, y, dest} => {
+                self.store(dest, (self.load(x) < self.load(y)) as isize)?;
+            },
+            Op::Equal{x, y, dest} => {
+                self.store(dest, (self.load(x) == self.load(y)) as isize)?;
+            },
+            Op::AdjustRelativeBase{offset} => {
+                let new_base = self.relative_base as isize + self.load(offset);
                 if new_base < 0 {
                     return Err(format_err!(
                         "Overflow in opcode 9: base would be {}", new_base));
                 }
                 self.relative_base = new_base as usize;
-                self.pc += 2;
             },
-            99 => {
+            Op::Halt => {
                 self.state = ProgramState::Halted;
             },
-            _ => {
-                return Err(format_err!("Invalid opcode: {} (pc: {})",
-                                       self.mem[self.pc], self.pc));
-            },
+        }
+        if advance {
+            self.pc += op.size();
         }
         Ok(())
     }
 
     // Private
+
+    fn get_next_op(&self) -> Result<Op, Error> {
+        let opcode = self.mem[self.pc] % 100;
+        let op = match opcode {
+            1 => Op::Add {
+                x: self.get_param(0)?,
+                y: self.get_param(1)?,
+                dest: self.get_param(2)?,
+            },
+            2 => Op::Multiply {
+                x: self.get_param(0)?,
+                y: self.get_param(1)?,
+                dest: self.get_param(2)?,
+            },
+            3 => Op::Input {
+                dest: self.get_param(0)?,
+            },
+            4 => Op::Output {
+                value: self.get_param(0)?,
+            },
+            5 => Op::JumpIfTrue {
+                cond: self.get_param(0)?,
+                dest: self.get_param(1)?,
+            },
+            6 => Op::JumpIfFalse {
+                cond: self.get_param(0)?,
+                dest: self.get_param(1)?,
+            },
+            7 => Op::LessThan {
+                x: self.get_param(0)?,
+                y: self.get_param(1)?,
+                dest: self.get_param(2)?,
+            },
+            8 => Op::Equal {
+                x: self.get_param(0)?,
+                y: self.get_param(1)?,
+                dest: self.get_param(2)?,
+            },
+            9 => Op::AdjustRelativeBase {
+                offset: self.get_param(0)?,
+            },
+            99 => Op::Halt,
+            _ => {
+                return Err(format_err!("Invalid opcode: {} (pc: {})",
+                                       self.mem[self.pc], self.pc));
+            },
+        };
+        Ok(op)
+    }
 
     // Get the ith parameter (0-based) for the current instruction.
     fn get_param(&self, i: usize) -> Result<Parameter, Error> {
@@ -342,6 +370,41 @@ impl SimulatorIO {
             blocking_input: false,
         }
     }
+
+    fn read_input(&mut self) -> Result<Option<isize>, Error> {
+        match self.input_reader {
+            Some(ref receiver) => {
+                if self.blocking_input {
+                    Ok(Some(receiver.recv()?))
+                } else {
+                    match receiver.try_recv() {
+                        Ok(value) => Ok(Some(value)),
+                        Err(mpsc::TryRecvError::Empty) => Ok(None),
+                        Err(e) => Err(e.into()),
+                    }
+                }
+            },
+            None => {
+                return Err(format_err!(
+                    "Input called without input connected."));
+            },
+        }
+    }
+
+
+    fn send_output(&mut self, value: isize) -> Result<(), Error> {
+        match self.output_sender {
+            Some(ref sender) => {
+                sender.send(value)?;
+                self.last_output = value;
+                Ok(())
+            },
+            None => {
+                return Err(format_err!(
+                    "Output called without output connected."));
+            },
+        }
+    }
 }
 
 impl Parameter {
@@ -350,6 +413,23 @@ impl Parameter {
             Err(format_err!("Invalid address: {}", address))
         } else {
             Ok(Parameter::Address(address as usize))
+        }
+    }
+}
+
+impl Op {
+    fn size(&self) -> usize {
+        match self {
+            Op::Add{..} => 4,
+            Op::Multiply{..} => 4,
+            Op::Input{..} => 2,
+            Op::Output{..} => 2,
+            Op::JumpIfTrue{..} => 3,
+            Op::JumpIfFalse{..} => 3,
+            Op::LessThan{..} => 4,
+            Op::Equal{..} => 4,
+            Op::AdjustRelativeBase{..} => 2,
+            Op::Halt => 1,
         }
     }
 }
