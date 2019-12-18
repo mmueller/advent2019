@@ -1,5 +1,5 @@
 use crate::advent::AdventSolver;
-use crate::shared::intcode::IntcodeProgram;
+use crate::shared::intcode::{Program, Simulator};
 use anyhow::Error;
 
 #[derive(Default)]
@@ -17,11 +17,12 @@ impl AdventSolver for Solver {
 
 impl Solver {
     fn run_diagnostic_test(input: isize) -> Result<isize, Error> {
-        let mut program = IntcodeProgram::from_path("input/day05.txt")?;
-        let input_sender = program.create_input_channel();
-        let output_receiver = program.create_output_channel();
+        let program = Program::from_path("input/day05.txt")?;
+        let mut sim = Simulator::with_program(&program);
+        let input_sender = sim.create_input_channel();
+        let output_receiver = sim.create_output_channel();
         input_sender.send(input)?;
-        program.run()?;
+        sim.run()?;
         let mut result = 0;
         while result == 0 {
             result = output_receiver.recv()?;

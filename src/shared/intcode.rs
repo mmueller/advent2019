@@ -1,45 +1,52 @@
 use anyhow::{Error, format_err};
-use std::fmt;
 use std::fs::File;
 use std::io::Read;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc;
 
-type IntcodeReceiver = Receiver<isize>;
-type IntcodeSender = Sender<isize>;
+type Receiver = mpsc::Receiver<isize>;
+type Sender = mpsc::Sender<isize>;
 
-pub struct IntcodeProgram {
-    inst: Vec<isize>,
+pub struct Program {
+    instructions: Vec<isize>,
+}
+
+pub struct Simulator {
+    state: ProgramState,
+    mem: Vec<isize>,
     pc: usize,
-    state: IntcodeProgramState,
     relative_base: usize,
-    input_reader: Option<IntcodeReceiver>,
-    input_sender: Option<IntcodeSender>,
-    output_sender: Option<IntcodeSender>,
+    io: SimulatorIO,
+}
+
+struct SimulatorIO {
+    input_reader: Option<Receiver>,
+    input_sender: Option<Sender>,
+    output_sender: Option<Sender>,
     last_output: isize,
     blocking_input: bool,
-    waiting_for_input: bool,
 }
 
 #[derive(Clone,PartialEq)]
-pub enum IntcodeProgramState {
+enum ProgramState {
     Running,
+    Wait,
     Halted,
 }
 
+#[derive(Clone,Debug,PartialEq)]
+enum Parameter {
+    Address(usize),
+    Value(isize),
+}
+
 #[derive(Clone,PartialEq)]
-pub enum ParameterMode {
+enum ParameterMode {
     Position,
     Immediate,
     Relative,
 }
 
-#[derive(Clone,Debug,PartialEq)]
-pub enum Parameter {
-    Address(usize),
-    Value(isize),
-}
-
-impl IntcodeProgram {
+impl Program {
     pub fn from_path(path: &str) -> Result<Self, Error> {
         let mut text = String::new();
         File::open(path)?.read_to_string(&mut text)?;
@@ -51,35 +58,54 @@ impl IntcodeProgram {
                                    .map(|s| s.parse::<isize>())
                                    .collect::<Result<Vec<isize>, _>>()?;
         Ok(Self {
-            inst: inst,
-            pc: 0,
-            state: IntcodeProgramState::Running,
-            relative_base: 0,
-            input_sender: None,
-            input_reader: None,
-            output_sender: None,
-            last_output: 0,
-            blocking_input: true,
-            waiting_for_input: false,
+            instructions: inst,
         })
+    }
+}
+
+impl Simulator {
+    pub fn new() -> Self {
+        Self {
+            state: ProgramState::Halted,
+            mem: Vec::new(),
+            pc: 0,
+            relative_base: 0,
+            io: SimulatorIO::default(),
+        }
+    }
+
+    // Construct Simulator with the given program loaded, for convenience.
+    pub fn with_program(program: &Program) -> Self {
+        let mut sim = Self::new();
+        sim.load_program(program);
+        sim
+    }
+
+    // Load the given program into memory. Implicitly resets all state to new
+    // (I/O handlers are untouched).
+    pub fn load_program(&mut self, program: &Program) {
+        self.state = ProgramState::Halted;
+        self.mem = program.instructions.clone();
+        self.pc = 0;
+        self.relative_base = 0;
     }
 
     // Creates a channel for you and returns the sender half.
-    pub fn create_input_channel(&mut self) -> IntcodeSender {
-        let (sender, receiver) = channel();
-        self.input_reader = Some(receiver);
-        self.input_sender = Some(sender.clone());
+    pub fn create_input_channel(&mut self) -> Sender {
+        let (sender, receiver) = mpsc::channel();
+        self.io.input_reader = Some(receiver);
+        self.io.input_sender = Some(sender.clone());
         sender
     }
 
-    pub fn connect_input(&mut self, input: IntcodeReceiver,
-                         sender: IntcodeSender) {
-        self.input_reader = Some(input);
-        self.input_sender = Some(sender);
+    pub fn connect_input(&mut self, input: Receiver, sender: Sender) {
+        self.io.input_reader = Some(input);
+        self.io.input_sender = Some(sender);
     }
 
+    // TODO: Can we remove
     pub fn send_input(&self, value: isize) -> Result<(), Error> {
-        match &self.input_sender {
+        match &self.io.input_sender {
             Some(ref sender) => {
                 sender.send(value)?;
                 Ok(())
@@ -92,57 +118,43 @@ impl IntcodeProgram {
 
     #[allow(dead_code)]
     pub fn disconnect_input(&mut self) {
-        self.input_reader = None;
-        self.input_sender = None;
+        self.io.input_reader = None;
+        self.io.input_sender = None;
     }
 
     // Creates a channel for you and returns the receiver half.
-    pub fn create_output_channel(&mut self) -> IntcodeReceiver {
-        let (sender, receiver) = channel();
-        self.output_sender = Some(sender);
+    pub fn create_output_channel(&mut self) -> Receiver {
+        let (sender, receiver) = mpsc::channel();
+        self.io.output_sender = Some(sender);
         receiver
     }
 
-    pub fn connect_output(&mut self, output: IntcodeSender) {
-        self.output_sender = Some(output);
+    pub fn connect_output(&mut self, output: Sender) {
+        self.io.output_sender = Some(output);
     }
 
     #[allow(dead_code)]
     pub fn disconnect_output(&mut self) {
-        self.output_sender = None;
+        self.io.output_sender = None;
     }
 
+    // Feels hacky, but it's useful.
     pub fn last_output(&self) -> isize {
-        self.last_output
+        self.io.last_output
     }
 
-    // Same as run, but displays program state at each step.
-    #[allow(dead_code)]
-    pub fn debug(&mut self) -> Result<isize, Error> {
-        self.run_program(true)
+    // Return the value in memory at the given address.
+    pub fn peek(&self, address: usize) -> isize {
+        self.load(Parameter::Address(address))
     }
 
-    pub fn is_running(&self) -> bool {
-        self.state == IntcodeProgramState::Running
+    // Overwrite memory at the given address.
+    pub fn poke(&mut self, address: usize, value: isize) {
+        self.store(Parameter::Address(address), value).ok();
     }
 
-    // "output" as defined in day 2 (value at addr 0), not the channels
-    pub fn output(&self) -> isize {
-        self.inst[0]
-    }
-
-    // Set "inputs" as described in day 2, which means the values as positions 1
-    // and 2 in the program. Not the same as the input op.
-    pub fn set_inputs(&mut self, input1: isize, input2: isize) {
-        self.inst[1] = input1;
-        self.inst[2] = input2;
-    }
-
-    pub fn run(&mut self) -> Result<isize, Error> {
-        self.run_program(false)
-    }
-
-    pub fn run_until_input_needed(&mut self) -> Result<(), Error> {
+    pub fn run(&mut self) -> Result<(), Error> {
+        self.state = ProgramState::Running;
         while self.is_running() {
             self.step()?;
             if self.waiting_for_input() {
@@ -152,16 +164,21 @@ impl IntcodeProgram {
         Ok(())
     }
 
+    // True if running (even if blocked on input)
+    pub fn is_running(&self) -> bool {
+        self.state != ProgramState::Halted
+    }
+
     pub fn set_blocking_input(&mut self, blocking: bool) {
-        self.blocking_input = blocking;
+        self.io.blocking_input = blocking;
     }
 
     pub fn waiting_for_input(&self) -> bool {
-        self.waiting_for_input
+        self.state == ProgramState::Wait
     }
 
     pub fn step(&mut self) -> Result<(), Error> {
-        let op = self.inst[self.pc];
+        let op = self.mem[self.pc];
         match op % 100 {
             // Binary operations
             1 | 2 | 7 | 8 => {
@@ -180,19 +197,19 @@ impl IntcodeProgram {
             // Input
             3 => {
                 let target = self.get_param(0)?;
-                match self.input_reader {
+                match self.io.input_reader {
                     Some(ref receiver) => {
-                        if self.blocking_input {
+                        if self.io.blocking_input {
                             let value = receiver.recv()?;
                             self.store(target, value)?;
                         } else {
                             match receiver.try_recv() {
                                 Ok(value) => {
                                     self.store(target, value)?;
-                                    self.waiting_for_input = false;
+                                    self.state = ProgramState::Running;
                                 },
                                 Err(_) => {
-                                    self.waiting_for_input = true;
+                                    self.state = ProgramState::Wait;
                                 }
                             }
                         }
@@ -202,17 +219,17 @@ impl IntcodeProgram {
                             "Input op called without input channel."));
                     },
                 }
-                if !self.waiting_for_input {
+                if self.state != ProgramState::Wait {
                     self.pc += 2;
                 }
             },
             // Output
             4 => {
                 let value = self.load(self.get_param(0)?);
-                match self.output_sender {
+                match self.io.output_sender {
                     Some(ref sender) => {
                         sender.send(value)?;
-                        self.last_output = value;
+                        self.io.last_output = value;
                     },
                     None => {
                         return Err(format_err!(
@@ -243,11 +260,11 @@ impl IntcodeProgram {
                 self.pc += 2;
             },
             99 => {
-                self.state = IntcodeProgramState::Halted;
+                self.state = ProgramState::Halted;
             },
             _ => {
                 return Err(format_err!("Invalid opcode: {} (pc: {})",
-                                       self.inst[self.pc], self.pc));
+                                       self.mem[self.pc], self.pc));
             },
         }
         Ok(())
@@ -257,8 +274,8 @@ impl IntcodeProgram {
 
     // Get the ith parameter (0-based) for the current instruction.
     fn get_param(&self, i: usize) -> Result<Parameter, Error> {
-        let mode = Self::parameter_mode(self.inst[self.pc], i)?;
-        let raw_value = self.inst[self.pc + i + 1];
+        let mode = Self::parameter_mode(self.mem[self.pc], i)?;
+        let raw_value = self.mem[self.pc + i + 1];
         match mode {
             ParameterMode::Position => {
                 Parameter::to_address(raw_value)
@@ -276,10 +293,10 @@ impl IntcodeProgram {
     fn load(&self, param: Parameter) -> isize {
         match param {
             Parameter::Address(addr) => {
-                if addr >= self.inst.len() {
+                if addr >= self.mem.len() {
                     0
                 } else {
-                    self.inst[addr]
+                    self.mem[addr]
                 }
             },
             Parameter::Value(value) => value,
@@ -290,10 +307,10 @@ impl IntcodeProgram {
     fn store(&mut self, target: Parameter, value: isize) -> Result<(), Error> {
         match target {
             Parameter::Address(addr) => {
-                if addr >= self.inst.len() {
-                    self.inst.resize_with(addr+1, Default::default);
+                if addr >= self.mem.len() {
+                    self.mem.resize_with(addr+1, Default::default);
                 }
-                self.inst[addr] = value;
+                self.mem[addr] = value;
                 Ok(())
             },
             Parameter::Value(_value) => {
@@ -303,23 +320,7 @@ impl IntcodeProgram {
         }
     }
 
-    // Run implementation, with optional debug output.
-    fn run_program(&mut self, debug: bool) -> Result<isize, Error> {
-        while self.is_running() {
-            if debug {
-                println!("{:?}", self);
-            }
-            self.step()?;
-        }
-        Ok(self.output())
-    }
-
     fn parameter_mode(op: isize, param: usize) -> Result<ParameterMode, Error> {
-        // Hack: Use 0 op for write targets, which are addresses but we need
-        // their value.
-        if op == 0 {
-            return Ok(ParameterMode::Immediate);
-        }
         let mut op = op as usize;
         op /= 100 * 10_usize.pow(param as u32);
         match op % 10 {
@@ -331,29 +332,15 @@ impl IntcodeProgram {
     }
 }
 
-impl Clone for IntcodeProgram {
-    fn clone(&self) -> Self {
+impl SimulatorIO {
+    fn default() -> Self {
         Self {
-            inst: self.inst.clone(),
-            pc: self.pc,
-            state: self.state.clone(),
-            relative_base: self.relative_base,
             input_reader: None,
             input_sender: None,
             output_sender: None,
             last_output: 0,
-            blocking_input: true,
-            waiting_for_input: false,
+            blocking_input: false,
         }
-    }
-}
-
-impl fmt::Debug for IntcodeProgram {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.inst.iter()
-                                 .map(|i| i.to_string())
-                                 .collect::<Vec<String>>()
-                                 .join(","))
     }
 }
 
@@ -371,58 +358,61 @@ impl Parameter {
 mod tests {
     use super::*;
 
-    // Helper to run a program given in the string and return the value that
-    // ends up in position 0.
-    fn run_program(text: &str) -> isize {
-        let mut program = IntcodeProgram::from_string(text).unwrap();
-        program.run().unwrap()
-    }
-
-    // Helper to debug a program (useful if a test is failing)
-    #[allow(dead_code)]
-    fn debug_program(text: &str) -> isize {
-        let mut program = IntcodeProgram::from_string(text).unwrap();
-        program.debug().unwrap()
+    // Helper to run a program given in the string. Returns the simulator in
+    // case you want to inspect any state.
+    fn run_program(text: &str) -> Result<Simulator, Error> {
+        let program = Program::from_string(text).unwrap();
+        let mut sim = Simulator::with_program(&program);
+        sim.run()?;
+        Ok(sim)
     }
 
     // Helper to run a program with a particular input value and return the
-    // output value it yields (using the callbacks).
+    // output value it yields.
     fn run_program_io(text: &str, input: isize) -> Result<isize, Error> {
-        let mut program = IntcodeProgram::from_string(text).unwrap();
-        let input_sender = program.create_input_channel();
-        let output_receiver = program.create_output_channel();
+        let program = Program::from_string(text).unwrap();
+        let mut sim = Simulator::with_program(&program);
+        let input_sender = sim.create_input_channel();
+        let output_receiver = sim.create_output_channel();
         input_sender.send(input)?;
-        program.run()?;
+        sim.run()?;
         Ok(output_receiver.recv()?)
     }
 
     #[test]
     fn test_empty_program() {
-        assert_eq!(99, run_program("99"));
+        let sim = run_program("99").unwrap();
+        assert_eq!(99, sim.peek(0));
     }
 
     #[test]
     fn test_add() {
         // 1 + 1 = 2
-        assert_eq!(2, run_program("1,0,0,0,99"));
+        let sim = run_program("1,0,0,0,99").unwrap();
+        assert_eq!(2, sim.peek(0));
 
         // 1 + 1 + 1 = 3
-        assert_eq!(3, run_program("1,0,0,1,1,0,1,0,99"));
+        let sim = run_program("1,0,0,1,1,0,1,0,99").unwrap();
+        assert_eq!(3, sim.peek(0));
     }
 
     #[test]
     fn test_multiply() {
         // 2 + 3 = 6
-        assert_eq!(6, run_program("2,0,5,0,99,3"));
+        let sim = run_program("2,0,5,0,99,3").unwrap();
+        assert_eq!(6, sim.peek(0));
 
         // 2 * 3 * 4 = 24
-        assert_eq!(24, run_program("2,0,9,1,2,10,1,0,99,3,4"));
+        let sim = run_program("2,0,9,1,2,10,1,0,99,3,4").unwrap();
+        assert_eq!(24, sim.peek(0));
     }
 
     #[test]
     fn test_day2_examples() {
-        assert_eq!(3500, run_program("1,9,10,3,2,3,11,0,99,30,40,50"));
-        assert_eq!(30, run_program("1,1,1,4,99,5,6,0,99"));
+        let sim = run_program("1,9,10,3,2,3,11,0,99,30,40,50").unwrap();
+        assert_eq!(3500, sim.peek(0));
+        let sim = run_program("1,1,1,4,99,5,6,0,99").unwrap();
+        assert_eq!(30, sim.peek(0));
     }
 
     #[test]
@@ -506,27 +496,32 @@ mod tests {
 
     #[test]
     fn test_negative_values_ok() {
-        assert_eq!(-1, run_program("1,0,5,0,99,-2"));
+        let sim = run_program("1,0,5,0,99,-2").unwrap();
+        assert_eq!(-1, sim.peek(0));
     }
 
     #[test]
     fn test_immediate_mode() {
-        assert_eq!(1005, run_program("1001,0,4,0,99"));
+        let sim = run_program("1001,0,4,0,99").unwrap();
+        assert_eq!(1005, sim.peek(0));
     }
 
     #[test]
     fn test_input() {
-        let mut program = IntcodeProgram::from_string("3,0,99").unwrap();
-        let input_sender = program.create_input_channel();
+        let program = Program::from_string("3,0,99").unwrap();
+        let mut sim = Simulator::with_program(&program);
+        let input_sender = sim.create_input_channel();
         input_sender.send(5).unwrap();
-        assert_eq!(5, program.run().unwrap());
+        assert!(sim.run().is_ok());
+        assert_eq!(5, sim.peek(0));
     }
 
     #[test]
     fn test_output() {
-        let mut program = IntcodeProgram::from_string("4,0,99").unwrap();
-        let output_receiver = program.create_output_channel();
-        assert!(program.run().is_ok());
+        let program = Program::from_string("4,0,99").unwrap();
+        let mut sim = Simulator::with_program(&program);
+        let output_receiver = sim.create_output_channel();
+        assert!(sim.run().is_ok());
         assert_eq!(4, output_receiver.recv().unwrap());
     }
 
@@ -537,17 +532,13 @@ mod tests {
             109, 1, 204, -1, 1001, 100, 1, 100, 1008, 100, 16, 101,
             1006, 101, 0, 99
         ];
-        let mut program =
-            IntcodeProgram::from_string(&quine.iter()
-                                              .map(|v| v.to_string())
-                                              .collect::<Vec<String>>()
-                                              .join(",")).unwrap();
-        let reader = program.create_output_channel();
-        match program.run() {
-            Ok(_) => {},
-            Err(e) => { assert!(false, e.to_string()) },
-        }
-        assert!(program.run().is_ok());
+        let program = Program::from_string(&quine.iter()
+                              .map(|v| v.to_string())
+                              .collect::<Vec<String>>()
+                              .join(",")).unwrap();
+        let mut sim = Simulator::with_program(&program);
+        let reader = sim.create_output_channel();
+        assert!(sim.run().is_ok());
         for &v in quine.iter() {
             assert_eq!(v, reader.recv().unwrap());
         }
@@ -556,28 +547,29 @@ mod tests {
     #[test]
     fn test_large_multiply() {
         // Example from day 9
-        let mut program = IntcodeProgram::from_string(
+        let program = Program::from_string(
             "1102,34915192,34915192,7,4,7,99,0").unwrap();
-        let reader = program.create_output_channel();
-        assert!(program.run().is_ok());
+        let mut sim = Simulator::with_program(&program);
+        let reader = sim.create_output_channel();
+        assert!(sim.run().is_ok());
         assert_eq!(1219070632396864, reader.recv().unwrap());
     }
 
     #[test]
     fn test_large_value() {
         // Example from day 9
-        let mut program = IntcodeProgram::from_string(
-            "104,1125899906842624,99").unwrap();
-        let reader = program.create_output_channel();
-        assert!(program.run().is_ok());
+        let program = Program::from_string("104,1125899906842624,99").unwrap();
+        let mut sim = Simulator::with_program(&program);
+        let reader = sim.create_output_channel();
+        assert!(sim.run().is_ok());
         assert_eq!(1125899906842624, reader.recv().unwrap());
     }
 
     #[test]
     fn test_storing_to_immediate_param_fails() {
-        let mut program = IntcodeProgram::from_string("11101,1,1,1,99")
-                                         .unwrap();
-        let result = program.run();
+        let program = Program::from_string("11101,1,1,1,99").unwrap();
+        let mut sim = Simulator::with_program(&program);
+        let result = sim.run();
         assert!(result.is_err());
         assert_eq!("Cannot store using immediate parameter Value(1)",
                    result.unwrap_err().to_string());

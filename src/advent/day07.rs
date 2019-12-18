@@ -1,5 +1,5 @@
 use crate::advent::AdventSolver;
-use crate::shared::intcode::IntcodeProgram;
+use crate::shared::intcode::{Program, Simulator};
 use anyhow::Error;
 use permutohedron::LexicalPermutation;
 use std::sync::mpsc::channel;
@@ -11,7 +11,7 @@ const NUM_AMPLIFIERS: isize = 5;
 
 impl AdventSolver for Solver {
     fn solve(&mut self) -> Result<(), Error> {
-        let program = IntcodeProgram::from_path("input/day07.txt")?;
+        let program = Program::from_path("input/day07.txt")?;
         let mut phases: Vec<isize> = (0..NUM_AMPLIFIERS).collect();
         let mut max_signal: isize = 0;
         loop {
@@ -43,7 +43,7 @@ impl AdventSolver for Solver {
 }
 
 impl Solver {
-    fn run_amplifier_config(program: &IntcodeProgram,
+    fn run_amplifier_config(program: &Program,
                             phases: &Vec<isize>) -> Result<isize, Error>
     {
         let mut signal = 0;
@@ -53,63 +53,61 @@ impl Solver {
         Ok(signal)
     }
 
-    fn run_feedback_loop(program: &IntcodeProgram,
+    fn run_feedback_loop(program: &Program,
                          phases: &Vec<isize>) -> Result<isize, Error>
     {
         let count = phases.len();
-        let mut programs = (0..count).map(|_| {
-                                         let mut p = program.clone();
-                                         p.set_blocking_input(false);
-                                         p
-                                     })
-                                     .collect::<Vec<IntcodeProgram>>();
+        let mut sims =
+            (0..count).map(|_| {
+                          let mut sim = Simulator::with_program(program);
+                          sim.set_blocking_input(false);
+                          sim
+                      })
+                      .collect::<Vec<Simulator>>();
 
         // Wire up the amplifiers in a series
         for i in 0..count-1 {
             let (sender, receiver) = channel();
-            programs[i+1].connect_input(receiver, sender.clone());
-            programs[i].connect_output(sender);
+            sims[i+1].connect_input(receiver, sender.clone());
+            sims[i].connect_output(sender);
         }
 
         // Close the loop
         let (loop_sender, loop_receiver) = channel();
-        programs[0].connect_input(loop_receiver, loop_sender.clone());
-        programs[count-1].connect_output(loop_sender);
+        sims[0].connect_input(loop_receiver, loop_sender.clone());
+        sims[count-1].connect_output(loop_sender);
 
         // Initialize phase values
         for i in 0..count {
-            programs[i].send_input(phases[i])?;
+            sims[i].send_input(phases[i])?;
         }
 
         // Provide the input signal 0
-        programs[0].send_input(0)?;
+        sims[0].send_input(0)?;
 
         // Run the programs
-        let mut running = true;
-        while running {
-            running = false;
-            for program in programs.iter_mut() {
-                program.run_until_input_needed()?;
-                // If any program is running, keep going.
-                if program.is_running() {
-                    running = true;
-                }
+        loop {
+            for sim in sims.iter_mut() {
+                sim.run()?;
+            }
+            if !sims.iter().any(|sim| sim.is_running()) {
+                break;
             }
         }
 
         // Return the last output value
-        Ok(programs[count-1].last_output())
+        Ok(sims[count-1].last_output())
     }
 
-    fn run_single_amplifier(p: &IntcodeProgram,
+    fn run_single_amplifier(program: &Program,
                             phase: isize, signal: isize) -> Result<isize, Error>
     {
-        let mut program: IntcodeProgram = p.clone();
-        let input_sender = program.create_input_channel();
-        let output_receiver = program.create_output_channel();
+        let mut sim = Simulator::with_program(program);
+        let input_sender = sim.create_input_channel();
+        let output_receiver = sim.create_output_channel();
         input_sender.send(phase)?;
         input_sender.send(signal)?;
-        program.run()?;
+        sim.run()?;
         Ok(output_receiver.recv()?)
     }
 }
