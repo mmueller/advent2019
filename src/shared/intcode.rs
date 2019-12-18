@@ -11,6 +11,7 @@ pub struct IntcodeProgram {
     inst: Vec<isize>,
     pc: usize,
     state: IntcodeProgramState,
+    relative_base: usize,
     input_reader: Option<IntcodeReceiver>,
     input_sender: Option<IntcodeSender>,
     output_sender: Option<IntcodeSender>,
@@ -29,6 +30,13 @@ pub enum IntcodeProgramState {
 pub enum ParameterMode {
     Position,
     Immediate,
+    Relative,
+}
+
+#[derive(Clone,Debug,PartialEq)]
+pub enum Parameter {
+    Address(usize),
+    Value(isize),
 }
 
 impl IntcodeProgram {
@@ -46,6 +54,7 @@ impl IntcodeProgram {
             inst: inst,
             pc: 0,
             state: IntcodeProgramState::Running,
+            relative_base: 0,
             input_sender: None,
             input_reader: None,
             output_sender: None,
@@ -156,29 +165,30 @@ impl IntcodeProgram {
         match op % 100 {
             // Binary operations
             1 | 2 | 7 | 8 => {
-                let param0 = self.get_param(op, 0)?;
-                let param1 = self.get_param(op, 1)?;
-                let target = self.get_param(0, 2)?;
-                self.inst[target as usize] = match op % 100 {
+                let param0 = self.load(self.get_param(0)?);
+                let param1 = self.load(self.get_param(1)?);
+                let target = self.get_param(2)?;
+                self.store(target, match op % 100 {
                     1 => param0 + param1,
                     2 => param0 * param1,
                     7 => if param0 < param1 { 1 } else { 0 },
                     8 => if param0 == param1 { 1 } else { 0 },
                     _ => unreachable!(),
-                };
+                })?;
                 self.pc += 4;
             },
             // Input
             3 => {
-                let target = self.get_param(0, 0)?;
+                let target = self.get_param(0)?;
                 match self.input_reader {
                     Some(ref receiver) => {
                         if self.blocking_input {
-                            self.inst[target as usize] = receiver.recv()?;
+                            let value = receiver.recv()?;
+                            self.store(target, value)?;
                         } else {
                             match receiver.try_recv() {
                                 Ok(value) => {
-                                    self.inst[target as usize] = value;
+                                    self.store(target, value)?;
                                     self.waiting_for_input = false;
                                 },
                                 Err(_) => {
@@ -198,7 +208,7 @@ impl IntcodeProgram {
             },
             // Output
             4 => {
-                let value = self.get_param(op, 0)?;
+                let value = self.load(self.get_param(0)?);
                 match self.output_sender {
                     Some(ref sender) => {
                         sender.send(value)?;
@@ -213,13 +223,24 @@ impl IntcodeProgram {
             },
             // Jump-if-true and jump-if-false
             5 | 6 => {
-                let val = self.get_param(op, 0)?;
-                let addr = self.get_param(op, 1)?;
+                let val = self.load(self.get_param(0)?);
+                let addr = self.load(self.get_param(1)?);
                 if op % 100 == 5 && val != 0 || op % 100 == 6 && val == 0 {
                     self.pc = addr as usize;
                 } else {
                     self.pc += 3;
                 }
+            },
+            // Adjust relative base
+            9 => {
+                let val = self.load(self.get_param(0)?);
+                let new_base = self.relative_base as isize + val;
+                if new_base < 0 {
+                    return Err(format_err!(
+                        "Overflow in opcode 9: base would be {}", new_base));
+                }
+                self.relative_base = new_base as usize;
+                self.pc += 2;
             },
             99 => {
                 self.state = IntcodeProgramState::Halted;
@@ -234,15 +255,50 @@ impl IntcodeProgram {
 
     // Private
 
-    fn get_param(&self, op: isize, param_no: usize) -> Result<isize, Error> {
-        let mode = Self::parameter_mode(op, param_no)?;
-        let value = self.inst[self.pc + param_no + 1];
+    // Get the ith parameter (0-based) for the current instruction.
+    fn get_param(&self, i: usize) -> Result<Parameter, Error> {
+        let mode = Self::parameter_mode(self.inst[self.pc], i)?;
+        let raw_value = self.inst[self.pc + i + 1];
         match mode {
             ParameterMode::Position => {
-                Ok(self.inst[value as usize])
+                Parameter::to_address(raw_value)
             },
             ParameterMode::Immediate => {
-                Ok(value)
+                Ok(Parameter::Value(raw_value))
+            },
+            ParameterMode::Relative => {
+                Parameter::to_address(self.relative_base as isize + raw_value)
+            },
+        }
+    }
+
+    // Read the value of the parameter, dereferencing if it is an address.
+    fn load(&self, param: Parameter) -> isize {
+        match param {
+            Parameter::Address(addr) => {
+                if addr >= self.inst.len() {
+                    0
+                } else {
+                    self.inst[addr]
+                }
+            },
+            Parameter::Value(value) => value,
+        }
+    }
+
+    // Target must be an address
+    fn store(&mut self, target: Parameter, value: isize) -> Result<(), Error> {
+        match target {
+            Parameter::Address(addr) => {
+                if addr >= self.inst.len() {
+                    self.inst.resize_with(addr+1, Default::default);
+                }
+                self.inst[addr] = value;
+                Ok(())
+            },
+            Parameter::Value(_value) => {
+                Err(format_err!(
+                    "Cannot store using immediate parameter {:?}", target))
             },
         }
     }
@@ -269,6 +325,7 @@ impl IntcodeProgram {
         match op % 10 {
             0 => Ok(ParameterMode::Position),
             1 => Ok(ParameterMode::Immediate),
+            2 => Ok(ParameterMode::Relative),
             _ => Err(format_err!("Invalid parameter mode: {}", op % 10)),
         }
     }
@@ -280,6 +337,7 @@ impl Clone for IntcodeProgram {
             inst: self.inst.clone(),
             pc: self.pc,
             state: self.state.clone(),
+            relative_base: self.relative_base,
             input_reader: None,
             input_sender: None,
             output_sender: None,
@@ -296,6 +354,16 @@ impl fmt::Debug for IntcodeProgram {
                                  .map(|i| i.to_string())
                                  .collect::<Vec<String>>()
                                  .join(","))
+    }
+}
+
+impl Parameter {
+    fn to_address(address: isize) -> Result<Parameter, Error> {
+        if address < 0 {
+            Err(format_err!("Invalid address: {}", address))
+        } else {
+            Ok(Parameter::Address(address as usize))
+        }
     }
 }
 
@@ -460,5 +528,58 @@ mod tests {
         let output_receiver = program.create_output_channel();
         assert!(program.run().is_ok());
         assert_eq!(4, output_receiver.recv().unwrap());
+    }
+
+    #[test]
+    fn test_quine() {
+        // Example from Day 9, a program that outputs itself.
+        let quine: Vec<isize> = vec![
+            109, 1, 204, -1, 1001, 100, 1, 100, 1008, 100, 16, 101,
+            1006, 101, 0, 99
+        ];
+        let mut program =
+            IntcodeProgram::from_string(&quine.iter()
+                                              .map(|v| v.to_string())
+                                              .collect::<Vec<String>>()
+                                              .join(",")).unwrap();
+        let reader = program.create_output_channel();
+        match program.run() {
+            Ok(_) => {},
+            Err(e) => { assert!(false, e.to_string()) },
+        }
+        assert!(program.run().is_ok());
+        for &v in quine.iter() {
+            assert_eq!(v, reader.recv().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_large_multiply() {
+        // Example from day 9
+        let mut program = IntcodeProgram::from_string(
+            "1102,34915192,34915192,7,4,7,99,0").unwrap();
+        let reader = program.create_output_channel();
+        assert!(program.run().is_ok());
+        assert_eq!(1219070632396864, reader.recv().unwrap());
+    }
+
+    #[test]
+    fn test_large_value() {
+        // Example from day 9
+        let mut program = IntcodeProgram::from_string(
+            "104,1125899906842624,99").unwrap();
+        let reader = program.create_output_channel();
+        assert!(program.run().is_ok());
+        assert_eq!(1125899906842624, reader.recv().unwrap());
+    }
+
+    #[test]
+    fn test_storing_to_immediate_param_fails() {
+        let mut program = IntcodeProgram::from_string("11101,1,1,1,99")
+                                         .unwrap();
+        let result = program.run();
+        assert!(result.is_err());
+        assert_eq!("Cannot store using immediate parameter Value(1)",
+                   result.unwrap_err().to_string());
     }
 }
