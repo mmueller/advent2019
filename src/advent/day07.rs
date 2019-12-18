@@ -66,24 +66,19 @@ impl Solver {
                       .collect::<Vec<Simulator>>();
 
         // Wire up the amplifiers in a series
-        for i in 0..count-1 {
+        for i in 1..count {
             let (sender, receiver) = channel();
-            sims[i+1].connect_input(receiver, sender.clone());
-            sims[i].connect_output(sender);
+            sims[i].connect_input(receiver);
+            sims[i-1].connect_output(sender.clone());
+            sender.send(phases[i])?;
         }
 
         // Close the loop
         let (loop_sender, loop_receiver) = channel();
-        sims[0].connect_input(loop_receiver, loop_sender.clone());
-        sims[count-1].connect_output(loop_sender);
-
-        // Initialize phase values
-        for i in 0..count {
-            sims[i].send_input(phases[i])?;
-        }
-
-        // Provide the input signal 0
-        sims[0].send_input(0)?;
+        sims[0].connect_input(loop_receiver);
+        sims[count-1].connect_output(loop_sender.clone());
+        loop_sender.send(phases[0])?;
+        loop_sender.send(0)?;
 
         // Run the programs
         loop {
@@ -95,8 +90,10 @@ impl Solver {
             }
         }
 
-        // Return the last output value
-        Ok(sims[count-1].last_output())
+        // Get back the "loop" input channel so we can read the final output.
+        let loop_receiver = sims[0].disconnect_input()
+                                   .expect("should always return receiver!");
+        Ok(loop_receiver.recv()?)
     }
 
     fn run_single_amplifier(program: &Program,

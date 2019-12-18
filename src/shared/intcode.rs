@@ -20,9 +20,7 @@ pub struct Simulator {
 
 struct SimulatorIO {
     input_reader: Option<Receiver>,
-    input_sender: Option<Sender>,
     output_sender: Option<Sender>,
-    last_output: isize,
     blocking_input: bool,
 }
 
@@ -108,32 +106,15 @@ impl Simulator {
     pub fn create_input_channel(&mut self) -> Sender {
         let (sender, receiver) = mpsc::channel();
         self.io.input_reader = Some(receiver);
-        self.io.input_sender = Some(sender.clone());
         sender
     }
 
-    pub fn connect_input(&mut self, input: Receiver, sender: Sender) {
+    pub fn connect_input(&mut self, input: Receiver) {
         self.io.input_reader = Some(input);
-        self.io.input_sender = Some(sender);
     }
 
-    // TODO: Can we remove
-    pub fn send_input(&self, value: isize) -> Result<(), Error> {
-        match &self.io.input_sender {
-            Some(ref sender) => {
-                sender.send(value)?;
-                Ok(())
-            },
-            None => {
-                Err(format_err!("No input channel available."))
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn disconnect_input(&mut self) {
-        self.io.input_reader = None;
-        self.io.input_sender = None;
+    pub fn disconnect_input(&mut self) -> Option<Receiver> {
+        self.io.input_reader.take()
     }
 
     // Creates a channel for you and returns the receiver half.
@@ -152,11 +133,6 @@ impl Simulator {
         self.io.output_sender = None;
     }
 
-    // Feels hacky, but it's useful.
-    pub fn last_output(&self) -> isize {
-        self.io.last_output
-    }
-
     // Return the value in memory at the given address.
     pub fn peek(&self, address: usize) -> isize {
         self.load(Parameter::Address(address))
@@ -171,7 +147,7 @@ impl Simulator {
         self.state = ProgramState::Running;
         while self.is_running() {
             self.step()?;
-            if self.waiting_for_input() {
+            if self.state == ProgramState::Wait {
                 break;
             }
         }
@@ -185,10 +161,6 @@ impl Simulator {
 
     pub fn set_blocking_input(&mut self, blocking: bool) {
         self.io.blocking_input = blocking;
-    }
-
-    pub fn waiting_for_input(&self) -> bool {
-        self.state == ProgramState::Wait
     }
 
     pub fn step(&mut self) -> Result<(), Error> {
@@ -364,13 +336,17 @@ impl SimulatorIO {
     fn default() -> Self {
         Self {
             input_reader: None,
-            input_sender: None,
             output_sender: None,
-            last_output: 0,
             blocking_input: false,
         }
     }
 
+    // The Result<Option> is necessary because there are three outcomes:
+    //
+    //   1. Read a value: Ok(Some(value))
+    //   2. Read nothing: Ok(None)
+    //      (TryRecvError happened, but we don't treat that as an error)
+    //   3. An error occurred: Err(e)
     fn read_input(&mut self) -> Result<Option<isize>, Error> {
         match self.input_reader {
             Some(ref receiver) => {
@@ -396,7 +372,6 @@ impl SimulatorIO {
         match self.output_sender {
             Some(ref sender) => {
                 sender.send(value)?;
-                self.last_output = value;
                 Ok(())
             },
             None => {
