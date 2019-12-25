@@ -1,5 +1,7 @@
 // Cartesian grid structures and utilities.
 
+pub use super::infinite_grid::InfiniteGrid;
+
 #[derive(Clone,Copy,Debug)]
 pub enum Dir {
     Up,
@@ -44,6 +46,7 @@ pub struct Pos {
     pub col: isize
 }
 
+#[macro_export]
 macro_rules! pos {
     ($row:expr,$col:expr) => (
         Pos::new($row, $col)
