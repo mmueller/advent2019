@@ -7,5 +7,7 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0"
 argparse = ""
+lazy_static = ""
+num = ""
 permutohedron = ""
 regex = ""
