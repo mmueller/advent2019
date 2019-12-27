@@ -29,24 +29,35 @@ impl<T: Clone+PartialEq> InfiniteGrid<T> {
         let mut top = None;
         let mut right = None;
         let mut bottom = None;
-        for y in 0..self.rows.len() {
-            let row = self.rows.get(y).unwrap();
-            let first = row.iter().position(|v| v != &self.default);
-            let last = row.iter().rev().position(|v| v != &self.default);
-            if first.is_some() {
-                // We found `last` in a reversed iterator, calculate
-                // `last_pos` from the right for the real index.
-                let last_pos = row.len() - last.unwrap();
-                if top.is_none() {
-                    top = Some(y);
+        for y_index in 0..self.rows.len() {
+            let row = self.rows.get(y_index).unwrap();
+            let mut first_pos = None;
+            let mut last_pos = None;
+            for x_index in 0..row.len() {
+                if row[x_index] != self.default {
+                    let x_pos = Self::index_to_pos(x_index);
+                    if first_pos.is_none() || x_pos < first_pos.unwrap() {
+                        first_pos = Some(x_pos);
+                    }
+                    if last_pos.is_none() || x_pos > last_pos.unwrap() {
+                        last_pos = Some(x_pos);
+                    }
                 }
-                if left.is_none() || first.unwrap() < left.unwrap() {
-                    left = first;
+            }
+            if first_pos.is_some() {
+                let y_pos = Self::index_to_pos(y_index);
+                if top.is_none() || y_pos < top.unwrap() {
+                    top = Some(y_pos);
                 }
-                if right.is_none() || last_pos > right.unwrap() {
-                    right = Some(last_pos);
+                if bottom.is_none() || y_pos > bottom.unwrap() {
+                    bottom = Some(y_pos);
                 }
-                bottom = Some(y);
+                if left.is_none() || first_pos.unwrap() < left.unwrap() {
+                    left = first_pos;
+                }
+                if right.is_none() || last_pos.unwrap() > right.unwrap() {
+                    right = last_pos;
+                }
             }
         }
 
@@ -57,15 +68,17 @@ impl<T: Clone+PartialEq> InfiniteGrid<T> {
             let top = top.unwrap();
             let right = right.unwrap();
             let bottom = bottom.unwrap();
-            for y in top..=bottom {
-                let orig_row = self.rows.get(y).unwrap();
+            for y_pos in top..=bottom {
+                let y_index = Self::pos_to_index(y_pos);
+                let orig_row = self.rows.get(y_index).unwrap();
                 let mut row: Vec<T> = Vec::new();
-                for x in left..=right {
+                for x_pos in left..=right {
                     // Not all rows are the same width internally
-                    if x >= orig_row.len() {
+                    let x_index = Self::pos_to_index(x_pos);
+                    if x_index >= orig_row.len() {
                         row.push(self.default.clone());
                     } else {
-                        row.push(orig_row.get(x).unwrap().clone());
+                        row.push(orig_row.get(x_index).unwrap().clone());
                     }
                 }
                 result.push(row);
@@ -99,6 +112,15 @@ impl<T: Clone+PartialEq> InfiniteGrid<T> {
                          pos * 2
                      };
         result as usize
+    }
+
+    fn index_to_pos(index: usize) -> isize {
+        let index = index as isize;
+        if index % 2 == 0 {
+            index / 2
+        } else {
+            -index/2 - 1
+        }
     }
 }
 
