@@ -2,7 +2,7 @@
 
 pub use super::infinite_grid::InfiniteGrid;
 
-#[derive(Clone,Copy,Debug)]
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Dir {
     Up,
     Right,

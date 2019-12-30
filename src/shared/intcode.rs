@@ -3,8 +3,8 @@ use std::fs::File;
 use std::io::Read;
 use std::sync::mpsc;
 
-type Receiver = mpsc::Receiver<isize>;
-type Sender = mpsc::Sender<isize>;
+pub type Receiver = mpsc::Receiver<isize>;
+pub type Sender = mpsc::Sender<isize>;
 
 pub struct Program {
     instructions: Vec<isize>,
